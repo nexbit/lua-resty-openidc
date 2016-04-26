@@ -506,7 +506,12 @@ function openidc.authenticate(opts, target_url)
     target_url
 end
 
--- get an OAuth 2.0 bearer access token from the HTTP request
+--
+-- Get an OAuth 2.0 bearer access token from the HTTP request.
+-- NOTE: it searches first in the Authorization header then, if not found,
+--       in a cookie with the name set in opts.cookie_name (or with the 
+--       default 'bearer' name if option is not set)
+--
 local function openidc_get_bearer_access_token(opts) 
 
   local err
@@ -514,25 +519,31 @@ local function openidc_get_bearer_access_token(opts)
   -- get the access token from the Authorization header
   local headers = ngx.req.get_headers()
   local header =  headers['Authorization']
+  local access_token
 
   if header == nil or header:find(" ") == nil then
-    err = "no Authorization header found"
-    ngx.log(ngx.ERR, err)
-    return nil, err
-  end
+    -- before giving up, check if a cookie is present
+    local cookie_var_name = opts.cookie_name or "bearer"
+    access_token = ngx.var["cookie_" .. cookie_var_name]
+    if not access_token then
+      err = "no Authorization header or " .. cookie_var_name .. " cookie found"
+      ngx.log(ngx.ERR, err)
+      return nil, err
+    end
+  else
+		local divider = header:find(' ')
+		if string.lower(header:sub(0, divider-1)) ~= string.lower("Bearer") then
+			err = "no Bearer authorization header value found"
+			ngx.log(ngx.ERR, err)
+			return nil, err
+		end
 
-  local divider = header:find(' ')
-  if string.lower(header:sub(0, divider-1)) ~= string.lower("Bearer") then
-    err = "no Bearer authorization header value found"
-    ngx.log(ngx.ERR, err)
-    return nil, err
-  end
-
-  local access_token = header:sub(divider+1)
-  if access_token == nil then
-    err = "no Bearer access token value found"
-    ngx.log(ngx.ERR, err)
-    return nil, err
+		access_token = header:sub(divider+1)
+		if access_token == nil then
+			err = "no Bearer access token value found"
+			ngx.log(ngx.ERR, err)
+			return nil, err
+		end
   end
   
   return access_token, err
@@ -586,6 +597,7 @@ function openidc.introspect(opts)
   return json, err
 end
 
+
 -- main routine for OAuth 2.0 JWT token validation
 function openidc.bearer_jwt_verify(opts)
 
@@ -632,6 +644,78 @@ function openidc.bearer_jwt_verify(opts)
   end
   
   return json, err
+end
+
+--
+-- Verify and gets back profile information by querying a token info endpoint
+-- with a bearer token found in the current request.
+-- 
+-- Supported opts:
+--   tokeninfo_param_name (default = "id_token")
+--                        The name of the parameter that carries the token
+--                        when calling the tokeninfo endpoint
+--   
+--   tokeninfo_params 
+--                        Additional parameters when calling tokeninfo endpoint
+--
+--   cache_exp (default = 3600)
+--                        Duration of the cached profile in seconds, if cannot determine
+--                        expiration from the access_token exp field
+--
+function openidc.tokeninfo(opts)
+
+  local err
+  local profile_json
+
+  -- get the access token from the request
+  local access_token, err = openidc_get_bearer_access_token(opts)
+  if access_token == nil then
+    return nil, err
+  end
+
+  ngx.log(ngx.DEBUG, "access_token: ", access_token)
+  
+  -- see if we've previously cached the tokeninfo (profile) result for this token
+  local v = openidc_cache_get("tokeninfo", access_token)
+  if not v then
+
+    -- assemble the parameters to the introspection (token) endpoint
+    local token_param_name = opts.tokeninfo_param_name and opts.tokeninfo_param_name or "id_token"
+
+    local body = {}
+
+    body[token_param_name] = access_token
+
+    -- merge any provided extra parameters
+    if opts.tokeninfo_params then
+      for k,v in pairs(opts.tokeninfo_params) do body[k] = v end
+    end
+
+    -- call the tokeninfo endpoint
+    profile_json, err = openidc_call_token_endpoint(opts, opts.tokeninfo_endpoint, body, nil)
+
+    -- cache the results
+    if profile_json then
+      local enc_json = cjson.encode(profile_json)
+      ngx.log(ngx.DEBUG, "cached a profile : " .. enc_json)
+      -- the cache expiry time is set using the access_token expiry, or if decoding fails,
+      -- using the opts.cache_exp value
+      local jwt = require "resty.jwt"
+      local access_json = jwt:load_jwt(access_token)
+      access_json = access_json.payload
+      local exp = access_json and (access_json.exp - os.time()) or opts.cache_exp or 3600
+      openidc_cache_set("tokeninfo", access_token, enc_json, exp)
+    end
+
+  else
+    profile_json = cjson.decode(v)
+  end
+
+  return profile_json, err
+end
+
+function openidc.get_bearer_access_token(opts)
+  return openidc_get_bearer_access_token(opts)
 end
 
 return openidc
