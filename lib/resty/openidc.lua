@@ -492,4 +492,73 @@ function openidc.introspect(opts)
   return json, err
 end
 
+function openidc.tokeninfo(opts)
+
+  local err
+
+  -- get the id token from the Authorization header
+  local headers = ngx.req.get_headers()
+  local header =  headers['Authorization']
+
+  local id_token
+  if header == nil or header:find(" ") == nil then
+    -- before giving up, check if a bearer cookie is present
+    local cookie_var_name = opts.cookie_name or "bearer"
+    id_token = ngx.var["cookie_" .. cookie_var_name]
+    if not id_token then
+      err = "no Authorization header or " .. cookie_var_name .. " cookie found"
+      ngx.log(ngx.ERR, err)
+      return nil, err
+    end
+  else
+    local divider = header:find(' ')
+    if string.lower(header:sub(0, divider-1)) ~= string.lower("Bearer") then
+      err = "no Bearer authorization header value found"
+      ngx.log(ngx.ERR, err)
+      return nil, err
+    end
+
+    id_token = header:sub(divider+1)
+    if id_token == nil then
+      err = "no Bearer access token value found"
+      ngx.log(ngx.ERR, err)
+      return nil, err
+    end
+  end
+
+  -- see if we've previously cached the tokeninfo result for this id token
+  local json
+  local v = openidc_cache_get("tokeninfo", id_token)
+  if not v then
+
+    -- assemble the parameters to the introspection (token) endpoint
+    local token_param_name = opts.id_token_param_name and opts.id_token_param_name or "id_token"
+
+    local body = {}
+
+    body[token_param_name] = id_token
+
+    -- merge any provided extra parameters
+    if opts.id_params then
+      for k,v in pairs(opts.id_params) do body[k] = v end
+    end
+
+    -- call the tokeninfo endpoint
+    json, err = openidc_call_token_endpoint(opts.tokeninfo_endpoint, body, opts.ssl_verify)
+
+    -- cache the results
+    if json then
+      local enc_json = cjson.encode(json)
+      ngx.log(ngx.INFO, "Cached id_token : " .. enc_json)
+      --TODO: the cache expiry time defaults to 1 hour
+      openidc_cache_set("tokeninfo", id_token, enc_json, 3600)
+    end
+
+  else
+    json = cjson.decode(v)
+  end
+
+  return json, err
+end
+
 return openidc
