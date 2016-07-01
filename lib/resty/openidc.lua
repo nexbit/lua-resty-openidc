@@ -56,6 +56,7 @@ local pairs   = pairs
 local type    = type
 local ngx     = ngx
 local os      = os
+local ck = require "resty.cookie"
 
 local openidc = {
   _VERSION = "1.2"
@@ -161,33 +162,47 @@ end
 local function openidc_authorize(opts, session, target_url)
   local resty_random = require "resty.random"
   local resty_string = require "resty.string"
+  local state
+  local nonce
 
-  -- generate state and nonce
-  local state = resty_string.to_hex(resty_random.bytes(16))
-  local nonce = resty_string.to_hex(resty_random.bytes(16))
-
+  if (not opts.no_session) then
+    -- generate state and nonce
+    state = resty_string.to_hex(resty_random.bytes(16))
+    nonce = resty_string.to_hex(resty_random.bytes(16))
+  else
+    -- state is used to give back the original request url
+    state = target_url
+  end
+  
   -- assemble the parameters to the authentication request
   local params = {
     client_id=opts.client_id,
     response_type="code",
     scope=opts.scope and opts.scope or "openid email profile",
     redirect_uri=openidc_get_redirect_uri(opts),
-    state=state,
-    nonce=nonce
+    state = state
   }
+  if (not opts.no_session) then
+    params.nonce = nonce
+  end
 
   -- merge any provided extra parameters
   if opts.authorization_params then
     for k,v in pairs(opts.authorization_params) do params[k] = v end
   end
 
-  -- store state in the session
-  session:start()
-  session.data.original_url = target_url
-  session.data.state = state
-  session.data.nonce = nonce
-  session:save()
-
+  if (not opts.no_session) then
+    -- store state in the session
+    session:start()
+    session.data.original_url = target_url
+    session.data.state = state
+    session.data.nonce = nonce
+    session:save()
+  else
+    -- session should be a plain table if no_session is true
+    session.data.original_url = target_url
+  end
+  
   -- redirect to the /authorization endpoint
   return ngx.redirect(opts.discovery.authorization_endpoint.."?"..ngx.encode_args(params))
 end
@@ -285,14 +300,18 @@ local function openidc_authorization_response(opts, session)
   if not args.code or not args.state then
     err = "unhandled request to the redirect_uri: "..ngx.var.request_uri
     ngx.log(ngx.ERR, err)
-    return nil, err, session.data.original_url
+    return nil, err, session.data and session.data.original_url
   end
 
   -- check that the state returned in the response against the session; prevents CSRF
-  if args.state ~= session.data.state then
-    err = "state from argument: "..(args.state and args.state or "nil").." does not match state restored from session: "..(session.data.state and session.data.state or "nil")
-    ngx.log(ngx.ERR, err)
-    return nil, err, session.data.original_url
+  if (not opts.no_session) then
+    if (args.state ~= session.data.state) then
+      err = "state from argument: "..(args.state and args.state or "nil").." does not match state restored from session: "..(session.data.state and session.data.state or "nil")
+      ngx.log(ngx.ERR, err)
+      return nil, err, session.data.original_url
+    end
+  else
+    session.data.original_url = args.state
   end
 
   -- check the iss if returned from the OP
@@ -313,10 +332,12 @@ local function openidc_authorization_response(opts, session)
   local body = {
     grant_type="authorization_code",
     code=args.code,
-    redirect_uri=openidc_get_redirect_uri(opts),
-    state = session.data.state
+    redirect_uri=openidc_get_redirect_uri(opts)
   }
-
+  if (not opts.no_session) then
+    body.state = session.data.state
+  end
+  
   -- make the call to the token endpoint
   local json, err = openidc_call_token_endpoint(opts, opts.discovery.token_endpoint, body, opts.token_endpoint_auth_method)
   if err then
@@ -337,14 +358,33 @@ local function openidc_authorization_response(opts, session)
   -- call the user info endpoint
   -- TODO: should this error be checked?
   local user, err = openidc_call_userinfo_endpoint(opts, json.access_token)
+  local cookie
 
-  session:start()
+  if (not opts.no_session) then
+    session:start()
+  else
+    cookie = ck:new()
+  end
   session.data.user = user
   session.data.id_token = id_token
   session.data.access_token = json.access_token
-
-  -- save the session with the obtained id_token
-  session:save()
+  if (not opts.no_session) then
+    -- save the session with the obtained id_token
+    session:save()
+  else
+    local ok, err = cookie:set({
+      key = opts.cookie_name,
+      value = json.id_token,
+      max_age = id_token.exp - os.time(),
+      path = "/",
+      secure = true,
+      samesite = "Lax"
+    })
+    if not ok then
+      ngx.log(ngx.ERR, err)
+      return nil, err
+    end
+  end
 
   -- redirect to the URL that was accessed originally
   return ngx.redirect(session.data.original_url)
@@ -391,7 +431,9 @@ local openidc_transparent_pixel = "\137\080\078\071\013\010\026\010\000\000\000\
 
 -- handle logout
 local function openidc_logout(opts, session)
-  session:destroy()
+  if (not opts.no_session) then
+    session:destroy()
+  end
   local headers = ngx.req.get_headers()
   local header =  headers['Accept']
   if header and header:find("image/png") then
@@ -456,9 +498,17 @@ end
 function openidc.authenticate(opts, target_url)
 
   local err
-
-  local session = require("resty.session").open()
-
+  local session
+  
+  if (not opts.no_session) then
+    session = require("resty.session").open()
+  else
+    session = { data = {} }
+    -- check if we have a bearer id cookie
+    local cookie_var_name = opts.cookie_name or "bearer"
+    session.data.id_token = ngx.var["cookie_" .. cookie_var_name]
+  end
+  
   local target_url = target_url or ngx.var.request_uri
   
   if type(opts.discovery) == "string" then
@@ -648,7 +698,7 @@ end
 
 --
 -- Verify and gets back profile information by querying a token info endpoint
--- with a bearer token found in the current request.
+-- with an id token.
 -- 
 -- Supported opts:
 --   tokeninfo_param_name (default = "id_token")
@@ -660,23 +710,23 @@ end
 --
 --   cache_exp (default = 3600)
 --                        Duration of the cached profile in seconds, if cannot determine
---                        expiration from the access_token exp field
+--                        expiration from the id_token exp field
 --
 function openidc.tokeninfo(opts)
 
   local err
   local profile_json
 
-  -- get the access token from the request
-  local access_token, err = openidc_get_bearer_access_token(opts)
-  if access_token == nil then
+  -- get the id_token from the request
+  local id_token, err = openidc_get_bearer_access_token(opts)
+  if id_token == nil then
     return nil, err
   end
 
-  ngx.log(ngx.DEBUG, "access_token: ", access_token)
+  ngx.log(ngx.DEBUG, "id_token: ", id_token)
   
   -- see if we've previously cached the tokeninfo (profile) result for this token
-  local v = openidc_cache_get("tokeninfo", access_token)
+  local v = openidc_cache_get("tokeninfo", id_token)
   if not v then
 
     -- assemble the parameters to the introspection (token) endpoint
@@ -684,7 +734,7 @@ function openidc.tokeninfo(opts)
 
     local body = {}
 
-    body[token_param_name] = access_token
+    body[token_param_name] = id_token
 
     -- merge any provided extra parameters
     if opts.tokeninfo_params then
@@ -698,13 +748,13 @@ function openidc.tokeninfo(opts)
     if profile_json then
       local enc_json = cjson.encode(profile_json)
       ngx.log(ngx.DEBUG, "cached a profile : " .. enc_json)
-      -- the cache expiry time is set using the access_token expiry, or if decoding fails,
+      -- the cache expiry time is set using the id_token expiry, or if decoding fails,
       -- using the opts.cache_exp value
       local jwt = require "resty.jwt"
-      local access_json = jwt:load_jwt(access_token)
+      local access_json = jwt:load_jwt(id_token)
       access_json = access_json.payload
       local exp = access_json and (access_json.exp - os.time()) or opts.cache_exp or 3600
-      openidc_cache_set("tokeninfo", access_token, enc_json, exp)
+      openidc_cache_set("tokeninfo", id_token, enc_json, exp)
     end
 
   else
